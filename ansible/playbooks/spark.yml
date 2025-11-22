@@ -1,0 +1,296 @@
+- name: Deploy Apache Spark Cluster
+  hosts: spark_all
+  become: yes
+  vars:
+    install_dir: /opt
+    spark_user: spark
+    spark_group: spark
+    jdk_version: "jdk1.8.0_202"
+    spark_version: "spark-2.4.3-bin-hadoop2.7"
+    jdk_url: "https://hagimont.freeboxos.fr/hagimont/software/jdk-8u202-linux-x64.tar.gz"
+    spark_url: "https://archive.apache.org/dist/spark/spark-2.4.3/spark-2.4.3-bin-hadoop2.7.tgz"
+    spark_master_host: "{{ hostvars[groups['spark_master'][0]]['ansible_default_ipv4']['address'] }}"
+    spark_master_port: 7077
+    spark_master_webui_port: 8080
+    spark_worker_webui_port: 8081
+
+  tasks:
+    - name: Create installation directory
+      file:
+        path: "{{ install_dir }}"
+        state: directory
+        mode: '0755'
+
+    - name: Check if JDK is already installed
+      stat:
+        path: "{{ install_dir }}/{{ jdk_version }}"
+      register: jdk_installed
+
+    - name: Download JDK
+      get_url:
+        url: "{{ jdk_url }}"
+        dest: "/tmp/jdk.tar.gz"
+        mode: '0644'
+      when: not jdk_installed.stat.exists
+
+    - name: Extract JDK
+      unarchive:
+        src: "/tmp/jdk.tar.gz"
+        dest: "{{ install_dir }}"
+        remote_src: yes
+        creates: "{{ install_dir }}/{{ jdk_version }}"
+      when: not jdk_installed.stat.exists
+
+    - name: Check if /opt/java exists and remov if it's a directory
+      file:
+        path: "{{ install_dir }}/java"
+        state: absent
+      when: not jdk_installed.stat.exists
+
+    - name: Create Java symbolic link
+      file:
+        src: "{{ install_dir }}/{{ jdk_version }}"
+        dest: "{{ install_dir }}/java"
+        state: link
+      when: not jdk_installed.stat.exists
+
+    - name: Check if Spark is already installed
+      stat:
+        path: "{{ install_dir }}/{{ spark_version }}"
+      register: spark_installed
+
+    - name: Download Spark
+      get_url:
+        url: "{{ spark_url }}"
+        dest: "/tmp/spark.tgz"
+        mode: '0644'
+      when: not spark_installed.stat.exists
+
+    - name: Extract Spark
+      unarchive:
+        src: "/tmp/spark.tgz"
+        dest: "{{ install_dir }}"
+        remote_src: yes
+        creates: "{{ install_dir }}/{{ spark_version }}"
+      when: not spark_installed.stat.exists
+
+    - name: Create Spark symbolic link
+      file:
+        src: "{{ install_dir }}/{{ spark_version }}"
+        dest: "{{ install_dir }}/spark"
+        state: link
+
+    - name: Set ownership of installation directories
+      file:
+        path: "{{ item }}"
+        owner: "{{ spark_user }}"
+        group: "{{ spark_group }}"
+        recurse: yes
+      loop:
+        - "{{ install_dir }}/{{ jdk_version }}"
+        - "{{ install_dir }}/{{ spark_version }}"
+
+    - name: Configure environment variables for Spark user
+      blockinfile:
+        path: "/home/{{ spark_user }}/.bashrc"
+        block: |
+          export JAVA_HOME={{ install_dir }}/java
+          export SPARK_HOME={{ install_dir }}/spark
+          export PATH=$PATH:$JAVA_HOME/bin:$SPARK_HOME/bin:$SPARK_HOME/sbin
+        create: yes
+        owner: "{{ spark_user }}"
+        group: "{{ spark_group }}"
+
+    - name: Configure system-wide environment variables
+      copy:
+        dest: /etc/profile.d/spark.sh
+        content: |
+          export JAVA_HOME={{ install_dir }}/java
+          export SPARK_HOME={{ install_dir }}/spark
+          export PATH=$PATH:$JAVA_HOME/bin:$SPARK_HOME/bin:$SPARK_HOME/sbin
+        mode: '0644'
+
+    - name: Create Spark log directory
+      file:
+        path: /var/log/spark
+        state: directory
+        owner: "{{ spark_user }}"
+        group: "{{ spark_group }}"
+        mode: '0755'
+
+    - name: Create Spark work directory
+      file:
+        path: /var/lib/spark/work
+        state: directory
+        owner: "{{ spark_user }}"
+        group: "{{ spark_group }}"
+        mode: '0755'
+
+    - name: Create Spark pid directory
+      file:
+        path: /var/run/spark
+        state: directory
+        owner: "{{ spark_user }}"
+        group: "{{ spark_group }}"
+        mode: '0755'
+
+    - name: Create Spark event log directory
+      file:
+        path: /var/log/spark/events
+        state: directory
+        owner: "{{ spark_user }}"
+        group: "{{ spark_group }}"
+        mode: '0755'
+
+    - name: Configure spark-env.sh
+      copy:
+        dest: "{{ install_dir }}/spark/conf/spark-env.sh"
+        content: |
+          #!/usr/bin/env bash
+          export JAVA_HOME={{ install_dir }}/java
+          export SPARK_MASTER_HOST={{ spark_master_host }}
+          export SPARK_MASTER_PORT={{ spark_master_port }}
+          export SPARK_MASTER_WEBUI_PORT={{ spark_master_webui_port }}
+          export SPARK_WORKER_WEBUI_PORT={{ spark_worker_webui_port }}
+          export SPARK_LOG_DIR=/var/log/spark
+          export SPARK_WORKER_DIR=/var/lib/spark/work
+          export SPARK_PID_DIR=/var/run/spark
+          export SPARK_LOCAL_IP={{ ansible_default_ipv4.address }}
+        owner: "{{ spark_user }}"
+        group: "{{ spark_group }}"
+        mode: '0755'
+
+    - name: Configure spark-defaults.conf
+      copy:
+        dest: "{{ install_dir }}/spark/conf/spark-defaults.conf"
+        content: |
+          spark.master                     spark://{{ spark_master_host }}:{{ spark_master_port }}
+          spark.eventLog.enabled           true
+          spark.eventLog.dir               file:///var/log/spark/events
+          spark.history.fs.logDirectory    file:///var/log/spark/events
+          spark.serializer                 org.apache.spark.serializer.KryoSerializer
+          spark.driver.memory              1g
+          spark.executor.memory            1g
+        owner: "{{ spark_user }}"
+        group: "{{ spark_group }}"
+        mode: '0644'
+
+- name: Configure Spark Master
+  hosts: spark_master
+  become: yes
+  vars:
+    install_dir: /opt
+    spark_user: spark
+    spark_group: spark
+
+  tasks:
+    - name: Create workers file
+      copy:
+        dest: "{{ install_dir }}/spark/conf/slaves"
+        content: |
+          {% for host in groups['spark_workers'] %}
+          {{ hostvars[host]['ansible_default_ipv4']['address'] }}
+          {% endfor %}
+        owner: "{{ spark_user }}"
+        group: "{{ spark_group }}"
+        mode: '0644'
+
+    - name: Create systemd service for Spark Master
+      copy:
+        dest: /etc/systemd/system/spark-master.service
+        content: |
+          [Unit]
+          Description=Apache Spark Master
+          After=network.target
+
+          [Service]
+          Type=forking
+          User={{ spark_user }}
+          Group={{ spark_group }}
+          ExecStart={{ install_dir }}/spark/sbin/start-master.sh
+          ExecStop={{ install_dir }}/spark/sbin/stop-master.sh
+          Restart=on-failure
+          RestartSec=10
+
+          [Install]
+          WantedBy=multi-user.target
+        mode: '0644'
+
+    - name: Create systemd service for Spark History Server
+      copy:
+        dest: /etc/systemd/system/spark-history.service
+        content: |
+          [Unit]
+          Description=Apache Spark History Server
+          After=network.target
+
+          [Service]
+          Type=forking
+          User={{ spark_user }}
+          Group={{ spark_group }}
+          ExecStart={{ install_dir }}/spark/sbin/start-history-server.sh
+          ExecStop={{ install_dir }}/spark/sbin/stop-history-server.sh
+          Restart=on-failure
+          RestartSec=10
+
+          [Install]
+          WantedBy=multi-user.target
+        mode: '0644'
+
+    - name: Reload systemd daemon
+      systemd:
+        daemon_reload: yes
+
+    - name: Enable and start Spark Master service
+      systemd:
+        name: spark-master
+        enabled: yes
+        state: started
+
+    - name: Enable and start Spark History Server
+      systemd:
+        name: spark-history
+        enabled: yes
+        state: started
+
+- name: Configure Spark Workers
+  hosts: spark_workers
+  become: yes
+  vars:
+    install_dir: /opt
+    spark_user: spark
+    spark_group: spark
+    spark_master_host: "{{ hostvars[groups['spark_master'][0]]['ansible_default_ipv4']['address'] }}"
+    spark_master_port: 7077
+
+  tasks:
+    - name: Create systemd service for Spark Worker
+      copy:
+        dest: /etc/systemd/system/spark-worker.service
+        content: |
+          [Unit]
+          Description=Apache Spark Worker
+          After=network.target
+
+          [Service]
+          Type=forking
+          User={{ spark_user }}
+          Group={{ spark_group }}
+          ExecStart={{ install_dir }}/spark/sbin/start-slave.sh spark://{{ spark_master_host }}:{{ spark_master_port }}
+          ExecStop={{ install_dir }}/spark/sbin/stop-slave.sh
+          Restart=on-failure
+          RestartSec=10
+
+          [Install]
+          WantedBy=multi-user.target
+        mode: '0644'
+
+    - name: Reload systemd daemon
+      systemd:
+        daemon_reload: yes
+
+    - name: Enable and start Spark Worker service
+      systemd:
+        name: spark-worker
+        enabled: yes
+        state: started

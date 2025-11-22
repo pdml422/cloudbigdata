@@ -1,0 +1,215 @@
+- name: Prepare Spark test environment
+  hosts: spark_all
+  become: yes
+  vars:
+    spark_home: "/opt/spark"
+    test_file: "/home/spark/filesample.txt"
+    wordcount_jar: "/home/spark/wc.jar"
+    spark_master_host: "10.0.1.3"
+    spark_master_port: 7077
+    spark_master_url: "spark://{{ spark_master_host }}:{{ spark_master_port }}"
+
+  tasks:
+    - name: Clean previous output directories
+      file:
+        path: "{{ item }}"
+        state: absent
+      loop:
+        - "/home/spark/output-1-executor"
+        - "/home/spark/output-2-executors"
+        - "/home/spark/result"
+
+    - name: Create output directories
+      file:
+        path: "{{ item }}"
+        state: directory
+        owner: spark
+        group: spark
+        mode: '0755'
+      loop:
+        - "/home/spark/output-1-executor"
+        - "/home/spark/output-2-executors"
+
+- name: Copy test files to ALL nodes
+  hosts: spark_all
+  become: yes
+  vars:
+    test_file: "/home/spark/filesample.txt"
+    wordcount_jar: "/home/spark/wc.jar"
+
+  tasks:
+    - name: Copy test data to all nodes
+      copy:
+        src: "../../filesample.txt"
+        dest: "{{ test_file }}"
+        owner: spark
+        group: spark
+        mode: '0644'
+
+    - name: Copy WordCount jar to all nodes
+      copy:
+        src: "../../wc.jar"
+        dest: "{{ wordcount_jar }}"
+        owner: spark
+        group: spark
+        mode: '0644'
+
+- name: Run WordCount jobs on Spark cluster
+  hosts: spark_edge
+  become: yes
+  vars:
+    spark_home: "/opt/spark"
+    test_file: "/home/spark/filesample.txt"
+    wordcount_jar: "/home/spark/wc.jar"
+    spark_master_host: "10.0.1.3"
+    spark_master_port: 7077
+    spark_master_url: "spark://{{ spark_master_host }}:{{ spark_master_port }}"
+
+  tasks:
+    - name: Run WordCount with 1 executor as spark user
+      shell: |
+        sudo -u spark {{ spark_home }}/bin/spark-submit \
+          --class WordCount \
+          --master {{ spark_master_url }} \
+          --num-executors 1 \
+          --executor-memory 2g \
+          --driver-memory 1g \
+          --conf spark.eventLog.enabled=true \
+          --conf spark.eventLog.dir=file:///var/log/spark/events \
+          --conf spark.network.timeout=600 \
+          --conf spark.executor.heartbeatInterval=60 \
+          "{{ wordcount_jar }}" "{{ test_file }}" "file:///home/spark/output-1-executor"
+      args:
+        chdir: "/home/spark"
+      environment:
+        JAVA_HOME: "/opt/java"
+        SPARK_HOME: "{{ spark_home }}"
+      register: wordcount_1_executor
+      async: 300
+      poll: 10
+
+    - name: Check WordCount 1 executor result
+      async_status:
+        jid: "{{ wordcount_1_executor.ansible_job_id }}"
+      register: job_1_result
+      until: job_1_result.finished
+      retries: 30
+      delay: 10
+
+    - name: Display results for 1 executor
+      debug:
+        msg: |
+          WordCount with 1 executor:
+          Return code: {{ job_1_result.rc }}
+          Output: {{ job_1_result.stdout }}
+          Error: {{ job_1_result.stderr }}
+
+    - name: Run WordCount with 2 executors as spark user
+      shell: |
+        sudo -u spark {{ spark_home }}/bin/spark-submit \
+          --class WordCount \
+          --master {{ spark_master_url }} \
+          --num-executors 2 \
+          --executor-memory 2g \
+          --driver-memory 1g \
+          --conf spark.eventLog.enabled=true \
+          --conf spark.eventLog.dir=file:///var/log/spark/events \
+          --conf spark.network.timeout=600 \
+          --conf spark.executor.heartbeatInterval=60 \
+          "{{ wordcount_jar }}" "{{ test_file }}" "file:///home/spark/output-2-executors"
+      args:
+        chdir: "/home/spark"
+      environment:
+        JAVA_HOME: "/opt/java"
+        SPARK_HOME: "{{ spark_home }}"
+      register: wordcount_2_executors
+      async: 300
+      poll: 10
+      when: job_1_result.rc == 0
+
+    - name: Check WordCount 2 executors result
+      async_status:
+        jid: "{{ wordcount_2_executors.ansible_job_id }}"
+      register: job_2_result
+      until: job_2_result.finished
+      retries: 30
+      delay: 10
+      when: job_1_result.rc == 0
+
+    - name: Display results for 2 executors
+      debug:
+        msg: |
+          WordCount with 2 executors:
+          Return code: {{ job_2_result.rc }}
+          Output: {{ job_2_result.stdout }}
+          Error: {{ job_2_result.stderr }}
+      when: job_1_result.rc == 0
+
+- name: Verify and display test results
+  hosts: spark_edge
+  become: yes
+  vars:
+    spark_master_host: "10.0.1.3"
+    spark_master_port: 7077
+    spark_master_url: "spark://{{ spark_master_host }}:{{ spark_master_port }}"
+
+  tasks:
+    - name: Check output files for 1 executor as spark user
+      shell: |
+        sudo -u spark bash -c '
+          echo "=== Output directory structure for 1 executor ==="
+          find /home/spark/output-1-executor -type f -name "part-*" | head -5
+          echo "=== First 10 lines of output ==="
+          cat /home/spark/output-1-executor/part-* 2>/dev/null | head -10 || echo "No output files found"
+        '
+      register: output_1_check
+
+    - name: Check output files for 2 executors as spark user
+      shell: |
+        sudo -u spark bash -c '
+          echo "=== Output directory structure for 2 executors ==="
+          find /home/spark/output-2-executors -type f -name "part-*" | head -5
+          echo "=== First 10 lines of output ==="
+          cat /home/spark/output-2-executors/part-* 2>/dev/null | head -10 || echo "No output files found"
+        '
+      register: output_2_check
+      when: job_2_result.rc == 0
+
+    - name: Display output results for 1 executor
+      debug:
+        var: output_1_check.stdout
+      when: job_1_result.rc == 0
+
+    - name: Display output results for 2 executors
+      debug:
+        var: output_2_check.stdout
+      when: job_2_result.rc == 0
+
+    - name: Display final test status
+      debug:
+        msg: |
+          ===============================
+          SPARK CLUSTER TEST RESULTS
+          ===============================
+          WordCount with 1 executor: {{ "SUCCESS" if job_1_result.rc == 0 else "FAILED" }}
+          {% if job_1_result.rc == 0 %}
+          WordCount with 2 executors: {{ "SUCCESS" if job_2_result.rc == 0 else "FAILED" }}
+          {% endif %}
+
+          Cluster Information:
+          - Spark Master: {{ spark_master_url }}
+          - Spark Master Web UI: http://{{ spark_master_host }}:8080
+          - Spark History Server: http://{{ spark_master_host }}:18080
+
+          Test Files:
+          - Input data: /home/spark/filesample.txt
+          - WordCount JAR: /home/spark/wc.jar
+          - Output 1 executor: /home/spark/output-1-executor
+          {% if job_1_result.rc == 0 %}
+          - Output 2 executors: /home/spark/output-2-executors
+          {% endif %}
+
+    - name: Fail playbook if WordCount jobs failed
+      fail:
+        msg: "WordCount jobs failed. Check Spark cluster status and logs."
+      when: job_1_result.rc != 0
